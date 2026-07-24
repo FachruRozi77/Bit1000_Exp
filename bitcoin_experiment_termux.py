@@ -5,18 +5,14 @@ Bitcoin Puzzle Transaction — Scanner for unsolved puzzles #71-#160
 Targets ONLY the specific, publicly documented addresses of the
 Bitcoin Puzzle Transaction challenge.
 
-Termux / Android compatible: uses libsecp256k1.so via ctypes instead
-of pure-Python ecdsa, giving ~50-100x speedup.
+Termux / Android compatible: uses libsecp256k1.so via ctypes.
 
-Reality check: even with libsecp256k1, pure-Python ECC does roughly
-50,000-200,000 keys/sec on a phone CPU. Puzzle #71 alone has a ~2^70
-key search space. This will not realistically find anything -- it's
-here for tinkering/understanding the challenge.
+Reality check: even with libsecp256k1, brute-forcing puzzle #71+ on a phone
+is not realistic. This is for tinkering/understanding the challenge.
 
 Install (Termux):
     pkg install python
     pip install base58
-    # Make sure libsecp256k1.so is available (e.g. from bitcoin package)
 
 Usage:
     python3 bitcoin_puzzle_71_160.py [--workers N] [--batch N] [--puzzles 71,72,135]
@@ -34,30 +30,28 @@ from datetime import datetime
 from multiprocessing import Manager, Value
 from ctypes import (
     cdll, c_void_p, c_char_p, c_int, c_uint, c_size_t,
-    create_string_buffer, byref, POINTER
+    create_string_buffer, byref
 )
 
 try:
     import base58
 except ImportError:
-    print("[!] Missing base58. Install with:")
-    print("    pip install base58")
+    print("[!] Missing base58. Install with: pip install base58")
     sys.exit(1)
 
 # ─────────────────────────────────────────────────────────────────────────
 #  libsecp256k1.so LOADING via ctypes
 # ─────────────────────────────────────────────────────────────────────────
 
-# Try common paths for libsecp256k1.so
 LIB_PATHS = [
-    os.environ.get("LIBSECP256K1_PATH"),  # user override
+    os.environ.get("LIBSECP256K1_PATH"),
     "/data/data/com.termux/files/usr/lib/libsecp256k1.so",
     "/usr/lib/libsecp256k1.so",
     "/usr/local/lib/libsecp256k1.so",
     "/lib/libsecp256k1.so",
     "/usr/lib/x86_64-linux-gnu/libsecp256k1.so",
     "/usr/lib/aarch64-linux-gnu/libsecp256k1.so",
-    "libsecp256k1.so",  # system search
+    "libsecp256k1.so",
 ]
 
 _lib = None
@@ -73,30 +67,18 @@ for path in LIB_PATHS:
 
 if _lib is None:
     print("[!] Could not load libsecp256k1.so")
-    print("    Set LIBSECP256K1_PATH env var to the full path, e.g.:")
-    print("    export LIBSECP256K1_PATH=/path/to/libsecp256k1.so")
+    print("    Set LIBSECP256K1_PATH env var to the full path.")
     sys.exit(1)
 
-# ── CORRECT libsecp256k1 context flags ──
-# From secp256k1.h:
-#   SECP256K1_CONTEXT_NONE    = (1 << 0)  -- actually 0 in older versions
-#   SECP256K1_CONTEXT_SIGN    = (1 << 0)  = 1
-#   SECP256K1_CONTEXT_VERIFY  = (1 << 1)  = 2
-#   SECP256K1_CONTEXT_DECLASSIFY = (1 << 2) = 4  (newer versions)
-#
-# For pubkey_create we need SIGN context.
-SECP256K1_CONTEXT_NONE = 0
-SECP256K1_CONTEXT_SIGN = 1 << 0      # 1
-SECP256K1_CONTEXT_VERIFY = 1 << 1    # 2
+# ── CORRECT libsecp256k1 flags from secp256k1.h source ──
+# Context flags
+SECP256K1_CONTEXT_NONE   = 1       # SECP256K1_FLAGS_TYPE_CONTEXT
+SECP256K1_CONTEXT_VERIFY = 257     # TYPE_CONTEXT | BIT_CONTEXT_VERIFY (1 | 256)
+SECP256K1_CONTEXT_SIGN   = 513     # TYPE_CONTEXT | BIT_CONTEXT_SIGN   (1 | 512)
 
 # Serialization flags
-# From secp256k1.h:
-#   SECP256K1_EC_COMPRESSED   = (SECP256K1_FLAGS_TYPE_COMPRESSION | SECP256K1_FLAGS_BIT_COMPRESSION)
-#   SECP256K1_EC_UNCOMPRESSED = SECP256K1_FLAGS_TYPE_COMPRESSION
-#
-# The actual values depend on the library version. We try both common values.
-SECP256K1_EC_COMPRESSED_V1 = 0x02 | 0x01   # 3  (older versions)
-SECP256K1_EC_COMPRESSED_V2 = 0x100 | 0x200  # 768 (newer versions with type bits)
+SECP256K1_EC_COMPRESSED   = 258    # TYPE_COMPRESSION | BIT_COMPRESSION (2 | 256)
+SECP256K1_EC_UNCOMPRESSED = 2      # TYPE_COMPRESSION
 
 # Set up function signatures
 _lib.secp256k1_context_create.argtypes = [c_uint]
@@ -113,23 +95,19 @@ _lib.secp256k1_ec_pubkey_serialize.argtypes = [
 ]
 _lib.secp256k1_ec_pubkey_serialize.restype = c_int
 
-# Create context with SIGN flag (needed for pubkey_create)
-_ctx = _lib.secp256k1_context_create(SECP256K1_CONTEXT_SIGN)
-if not _ctx:
-    # Try with SIGN | VERIFY as fallback
-    _ctx = _lib.secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY)
+# Create context with SIGN | VERIFY (both bits set)
+_ctx = _lib.secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY)
 if not _ctx:
     print("[!] Failed to create secp256k1 context")
     sys.exit(1)
 
-# Randomize context for side-channel resistance
+# Randomize context
 _rand32 = os.urandom(32)
 _lib.secp256k1_context_randomize(_ctx, _rand32)
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  HARDCODED TARGETS: unsolved Bitcoin Puzzle Transaction addresses #71-#160
-#  Key for puzzle N lies in [2^(N-1), 2^N - 1].
+#  PUZZLE TARGETS
 # ─────────────────────────────────────────────────────────────────────────
 PUZZLES = {
     71:  (70, 71,  "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU"),
@@ -212,12 +190,10 @@ PUZZLES = {
     160: (159, 160, "1NBC8uXJy1GiJ6drkiZa1WuKn51ps7EPTv"),
 }
 
-TARGET_ADDRESSES = frozenset(addr for (_, _, addr) in PUZZLES.values())
-
 RESULT_FILE = "found_result.txt"
 
 # ─────────────────────────────────────────────────────────────────────────
-#  CRYPTO HELPERS (libsecp256k1 via ctypes — no coincurve, no pure-Python ECC)
+#  CRYPTO HELPERS
 # ─────────────────────────────────────────────────────────────────────────
 def _ripemd160_sha256(data: bytes) -> bytes:
     sha = hashlib.sha256(data).digest()
@@ -232,41 +208,26 @@ def _b58check(payload: bytes) -> str:
     return base58.b58encode(payload + _checksum(payload)).decode()
 
 
-def _to_bytes_32(n: int) -> bytes:
-    """Convert integer to 32-byte big-endian bytes."""
-    return n.to_bytes(32, "big")
-
-
 def private_key_to_address(pk_int: int):
     """Return (compressed_addr, wif_compressed) using libsecp256k1.so."""
-    # 1. Create public key from private key using libsecp256k1
-    seckey = _to_bytes_32(pk_int)
-    pubkey_buf = create_string_buffer(64)  # secp256k1_pubkey is 64 bytes internally
+    seckey = pk_int.to_bytes(32, "big")
+    pubkey_buf = create_string_buffer(64)
 
     ret = _lib.secp256k1_ec_pubkey_create(_ctx, pubkey_buf, seckey)
     if ret != 1:
         raise RuntimeError("secp256k1_ec_pubkey_create failed")
 
-    # 2. Serialize to compressed format (33 bytes)
     serialized = create_string_buffer(33)
     size = c_size_t(33)
 
-    # Try both common serialization flag values
-    for flag in (SECP256K1_EC_COMPRESSED_V1, SECP256K1_EC_COMPRESSED_V2):
-        ret = _lib.secp256k1_ec_pubkey_serialize(
-            _ctx, serialized, byref(size), pubkey_buf, flag
-        )
-        if ret == 1:
-            break
-    else:
-        raise RuntimeError("secp256k1_ec_pubkey_serialize failed with all flags")
+    ret = _lib.secp256k1_ec_pubkey_serialize(
+        _ctx, serialized, byref(size), pubkey_buf, SECP256K1_EC_COMPRESSED
+    )
+    if ret != 1:
+        raise RuntimeError("secp256k1_ec_pubkey_serialize failed")
 
     pub_comp = bytes(serialized[:33])
-
-    # 3. Build Bitcoin address
     addr = _b58check(b"\x00" + _ripemd160_sha256(pub_comp))
-
-    # 4. Build WIF
     wif = _b58check(b"\x80" + seckey + b"\x01")
 
     return addr, wif
@@ -286,7 +247,7 @@ def write_result(addr: str, pk: int, wif: str, puzzle_num: int):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  WORKER PROCESS
+#  WORKER
 # ─────────────────────────────────────────────────────────────────────────
 def worker(worker_id: int, puzzle_nums: list, stats_dict, lock,
            result_lock, stop_flag: Value, batch_size: int):
@@ -368,8 +329,7 @@ def main():
     parser.add_argument("--batch", type=int, default=100,
                          help="Keys checked per worker cycle before stats update")
     parser.add_argument("--puzzles", type=str, default=None,
-                         help="Comma-separated puzzle numbers to target, e.g. 71,72,135. "
-                              "Default: all unsolved 71-160.")
+                         help="Comma-separated puzzle numbers to target, e.g. 71,72,135.")
     args = parser.parse_args()
 
     if args.puzzles:
@@ -387,9 +347,8 @@ def main():
 
     print(f"[*] Targeting {len(puzzle_nums)} unsolved puzzle address(es).")
     print(f"[*] Workers: {args.workers}, batch size: {args.batch}")
-    print("[*] Using libsecp256k1.so via ctypes — much faster than pure-Python ECC.")
-    print("[*] Note: even with libsecp256k1, brute-forcing puzzle #71+ on a phone")
-    print("    is not realistic. Ctrl+C anytime to stop.\n")
+    print("[*] Using libsecp256k1.so via ctypes.")
+    print("[*] Ctrl+C anytime to stop.\n")
     time.sleep(1.5)
 
     manager = Manager()
