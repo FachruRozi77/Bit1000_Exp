@@ -78,7 +78,7 @@ if _lib is None:
     sys.exit(1)
 
 # Context flags
-SECP256K1_CONTEXT_NONE = 1 << 0
+SECP256K1_CONTEXT_NONE = 0
 SECP256K1_CONTEXT_SIGN = 1 << 0
 SECP256K1_CONTEXT_VERIFY = 1 << 1
 
