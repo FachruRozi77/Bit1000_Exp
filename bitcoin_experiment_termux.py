@@ -30,7 +30,7 @@ from datetime import datetime
 from multiprocessing import Manager, Value
 from ctypes import (
     cdll, c_void_p, c_char_p, c_int, c_uint, c_size_t,
-    create_string_buffer, byref
+    create_string_buffer, byref, POINTER
 )
 
 try:
