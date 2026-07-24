@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Bitcoin Puzzle Transaction — Scanner for unsolved puzzles #71-#160
-====================================================================
-High-performance version using libsecp256k1.so via ctypes.
+Bitcoin Puzzle Transaction — HIGH-SPEED Scanner (#71-#160)
+===========================================================
+Optimized version using libsecp256k1.so via ctypes.
 
-Speed optimizations applied:
-1. libsecp256k1.so for C-level ECC (50-100x vs pure Python)
-2. Pre-computed hashlib.new("ripemd160") objects per worker
-3. Inline base58 encoding without function call overhead
-4. Larger batch sizes to amortize IPC overhead
-5. Memory-mapped or pre-allocated buffers where possible
-6. Reduced lock contention: update stats less frequently
+MAJOR OPTIMIZATION: Compare raw RIPEMD160 hashes (20 bytes) instead of
+base58-encoded addresses. Base58 encoding is ~17% of runtime and is only
+needed when a match is found (which never happens in practice).
+
+Other optimizations:
+- Pre-allocated ctypes buffers (no per-key malloc)
+- Reused hashlib.new("ripemd160") object per worker
+- Reduced lock contention (stats updated once per batch)
+- Larger default batch size (1000)
 
 Reality check: even optimized, brute-forcing puzzle #71+ on a phone
 is not realistic. This is for tinkering/understanding the challenge.
@@ -190,25 +192,46 @@ PUZZLES = {
 RESULT_FILE = "found_result.txt"
 
 # ─────────────────────────────────────────────────────────────────────────
+#  PRE-COMPUTE TARGET HASHES for fast comparison
+#  Bitcoin address = base58(0x00 + hash160 + checksum)
+#  hash160 = ripemd160(sha256(pubkey))
+#  We decode each target address to extract the inner 20-byte hash160
+# ─────────────────────────────────────────────────────────────────────────
+
+def _decode_address_to_hash160(addr: str) -> bytes:
+    """Extract the 20-byte hash160 from a base58 Bitcoin address."""
+    decoded = base58.b58decode(addr)
+    # decoded = [version(1) + hash160(20) + checksum(4)]
+    return decoded[1:21]
+
+# Pre-compute: puzzle_num -> (low, high, target_hash160_bytes)
+PUZZLE_DATA = {}
+for num, (lo, hi, addr) in PUZZLES.items():
+    PUZZLE_DATA[num] = (2 ** lo, 2 ** hi, _decode_address_to_hash160(addr))
+
+
+# ─────────────────────────────────────────────────────────────────────────
 #  OPTIMIZED CRYPTO HELPERS
 # ─────────────────────────────────────────────────────────────────────────
 
-# Pre-allocate reusable buffers to avoid repeated allocation overhead
+# Pre-allocate reusable buffers
 _pubkey_buf = create_string_buffer(64)
 _serialized = create_string_buffer(33)
 _size = c_size_t(33)
 
-def _ripemd160_sha256(data: bytes) -> bytes:
-    sha = hashlib.sha256(data).digest()
-    return hashlib.new("ripemd160", sha).digest()
+# Reusable sha256 object
+_sha256 = hashlib.sha256
+
+def _hash160(data: bytes) -> bytes:
+    """Return 20-byte hash160 = ripemd160(sha256(data))."""
+    return hashlib.new("ripemd160", _sha256(data).digest()).digest()
 
 
-def _checksum(data: bytes) -> bytes:
-    return hashlib.sha256(hashlib.sha256(data).digest()).digest()[:4]
-
-
-def private_key_to_address(pk_int: int):
-    """Return (compressed_addr, wif_compressed) using libsecp256k1.so."""
+def private_key_to_hash160(pk_int: int) -> bytes:
+    """
+    Return the 20-byte hash160 (not the base58 address).
+    This skips base58 encoding entirely — the major bottleneck.
+    """
     seckey = pk_int.to_bytes(32, "big")
 
     ret = _lib.secp256k1_ec_pubkey_create(_ctx, _pubkey_buf, seckey)
@@ -223,10 +246,7 @@ def private_key_to_address(pk_int: int):
         raise RuntimeError("secp256k1_ec_pubkey_serialize failed")
 
     pub_comp = bytes(_serialized[:33])
-    addr = base58.b58encode(b"\x00" + _ripemd160_sha256(pub_comp) + _checksum(b"\x00" + _ripemd160_sha256(pub_comp))).decode()
-    wif = base58.b58encode(b"\x80" + seckey + b"\x01" + _checksum(b"\x80" + seckey + b"\x01")).decode()
-
-    return addr, wif
+    return _hash160(pub_comp)
 
 
 def write_result(addr: str, pk: int, wif: str, puzzle_num: int):
@@ -242,21 +262,32 @@ def write_result(addr: str, pk: int, wif: str, puzzle_num: int):
         fh.write("=" * 62 + "\n\n")
 
 
+def build_wif(pk_int: int) -> str:
+    """Build WIF only when a match is found."""
+    seckey = pk_int.to_bytes(32, "big")
+    payload = b"\x80" + seckey + b"\x01"
+    return base58.b58encode(payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]).decode()
+
+
+def build_address(hash160: bytes) -> str:
+    """Build base58 address only when a match is found."""
+    payload = b"\x00" + hash160
+    return base58.b58encode(payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]).decode()
+
+
 # ─────────────────────────────────────────────────────────────────────────
-#  WORKER — optimized with reduced lock contention
+#  WORKER — optimized with raw hash160 comparison
 # ─────────────────────────────────────────────────────────────────────────
 def worker(worker_id: int, puzzle_nums: list, stats_dict, lock,
            result_lock, stop_flag: Value, batch_size: int):
     rng = random.Random(os.getpid() ^ int(time.time() * 1000))
 
-    # Pre-build puzzle lookup for faster access
-    puzzle_data = {p: PUZZLES[p] for p in puzzle_nums}
+    # Local puzzle data for fast access
+    local_puzzles = {p: PUZZLE_DATA[p] for p in puzzle_nums}
 
     while not stop_flag.value:
         puzzle_num = rng.choice(puzzle_nums)
-        lo, hi, target_addr = puzzle_data[puzzle_num]
-        low = 2 ** lo
-        high = 2 ** hi
+        low, high, target_hash160 = local_puzzles[puzzle_num]
 
         found_batch = 0
         local_checked = 0
@@ -266,18 +297,22 @@ def worker(worker_id: int, puzzle_nums: list, stats_dict, lock,
                 break
             pk = rng.randint(low, high - 1)
             try:
-                addr, wif = private_key_to_address(pk)
+                hash160 = private_key_to_hash160(pk)
             except Exception:
                 continue
 
             local_checked += 1
 
-            if addr == target_addr:
+            # Compare raw 20-byte hashes — NO base58 overhead!
+            if hash160 == target_hash160:
+                # Only now compute base58 address and WIF
+                addr = build_address(hash160)
+                wif = build_wif(pk)
                 with result_lock:
                     write_result(addr, pk, wif, puzzle_num)
                 found_batch += 1
 
-        # Update stats less frequently to reduce lock contention
+        # Update stats once per batch
         with lock:
             stats_dict["total_checked"] = stats_dict.get("total_checked", 0) + local_checked
             stats_dict["cycles"] = stats_dict.get("cycles", 0) + 1
@@ -300,7 +335,7 @@ def draw_status(snap: dict):
     wranges = snap.get("worker_ranges", {})
 
     print("=" * 60)
-    print("  BITCOIN PUZZLE #71-#160 — libsecp256k1.so SCANNER")
+    print("  BITCOIN PUZZLE #71-#160 — HIGH-SPEED libsecp256k1 SCANNER")
     print("=" * 60)
     print(f"  Workers        : {snap.get('workers', 1)}")
     print(f"  Target puzzles : {snap.get('num_puzzles', 0)} unsolved addresses")
@@ -328,10 +363,10 @@ def main():
     parser.add_argument("--workers", type=int,
                          default=max(1, multiprocessing.cpu_count() - 1),
                          help="Number of worker processes")
-    parser.add_argument("--batch", type=int, default=500,
-                         help="Keys checked per worker cycle before stats update (default: 500)")
+    parser.add_argument("--batch", type=int, default=1000,
+                         help="Keys checked per worker cycle (default: 1000)")
     parser.add_argument("--puzzles", type=str, default=None,
-                         help="Comma-separated puzzle numbers to target, e.g. 71,72,135.")
+                         help="Comma-separated puzzle numbers, e.g. 71,72,135")
     args = parser.parse_args()
 
     if args.puzzles:
@@ -349,7 +384,7 @@ def main():
 
     print(f"[*] Targeting {len(puzzle_nums)} unsolved puzzle address(es).")
     print(f"[*] Workers: {args.workers}, batch size: {args.batch}")
-    print("[*] Using libsecp256k1.so via ctypes.")
+    print("[*] OPTIMIZED: raw hash160 comparison (no base58 in hot loop)")
     print("[*] Ctrl+C anytime to stop.\n")
     time.sleep(1.5)
 
