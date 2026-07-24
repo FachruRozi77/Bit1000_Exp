@@ -77,14 +77,26 @@ if _lib is None:
     print("    export LIBSECP256K1_PATH=/path/to/libsecp256k1.so")
     sys.exit(1)
 
-# Context flags
+# ── CORRECT libsecp256k1 context flags ──
+# From secp256k1.h:
+#   SECP256K1_CONTEXT_NONE    = (1 << 0)  -- actually 0 in older versions
+#   SECP256K1_CONTEXT_SIGN    = (1 << 0)  = 1
+#   SECP256K1_CONTEXT_VERIFY  = (1 << 1)  = 2
+#   SECP256K1_CONTEXT_DECLASSIFY = (1 << 2) = 4  (newer versions)
+#
+# For pubkey_create we need SIGN context.
 SECP256K1_CONTEXT_NONE = 0
-SECP256K1_CONTEXT_SIGN = 1
-SECP256K1_CONTEXT_VERIFY = 2
+SECP256K1_CONTEXT_SIGN = 1 << 0      # 1
+SECP256K1_CONTEXT_VERIFY = 1 << 1    # 2
 
 # Serialization flags
-SECP256K1_EC_COMPRESSED = 1 << 1 | 1 << 0   # 0x03
-SECP256K1_EC_UNCOMPRESSED = 1 << 1           # 0x02
+# From secp256k1.h:
+#   SECP256K1_EC_COMPRESSED   = (SECP256K1_FLAGS_TYPE_COMPRESSION | SECP256K1_FLAGS_BIT_COMPRESSION)
+#   SECP256K1_EC_UNCOMPRESSED = SECP256K1_FLAGS_TYPE_COMPRESSION
+#
+# The actual values depend on the library version. We try both common values.
+SECP256K1_EC_COMPRESSED_V1 = 0x02 | 0x01   # 3  (older versions)
+SECP256K1_EC_COMPRESSED_V2 = 0x100 | 0x200  # 768 (newer versions with type bits)
 
 # Set up function signatures
 _lib.secp256k1_context_create.argtypes = [c_uint]
@@ -101,8 +113,11 @@ _lib.secp256k1_ec_pubkey_serialize.argtypes = [
 ]
 _lib.secp256k1_ec_pubkey_serialize.restype = c_int
 
-# Create context (sign + verify)
-_ctx = _lib.secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY)
+# Create context with SIGN flag (needed for pubkey_create)
+_ctx = _lib.secp256k1_context_create(SECP256K1_CONTEXT_SIGN)
+if not _ctx:
+    # Try with SIGN | VERIFY as fallback
+    _ctx = _lib.secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY)
 if not _ctx:
     print("[!] Failed to create secp256k1 context")
     sys.exit(1)
@@ -235,11 +250,16 @@ def private_key_to_address(pk_int: int):
     # 2. Serialize to compressed format (33 bytes)
     serialized = create_string_buffer(33)
     size = c_size_t(33)
-    ret = _lib.secp256k1_ec_pubkey_serialize(
-        _ctx, serialized, byref(size), pubkey_buf, SECP256K1_EC_COMPRESSED
-    )
-    if ret != 1:
-        raise RuntimeError("secp256k1_ec_pubkey_serialize failed")
+
+    # Try both common serialization flag values
+    for flag in (SECP256K1_EC_COMPRESSED_V1, SECP256K1_EC_COMPRESSED_V2):
+        ret = _lib.secp256k1_ec_pubkey_serialize(
+            _ctx, serialized, byref(size), pubkey_buf, flag
+        )
+        if ret == 1:
+            break
+    else:
+        raise RuntimeError("secp256k1_ec_pubkey_serialize failed with all flags")
 
     pub_comp = bytes(serialized[:33])
 
